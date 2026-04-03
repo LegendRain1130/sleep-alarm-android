@@ -24,4 +24,3 @@
 
 ## 下载
 请前往 GitHub Releases 页面下载最新 APK。
-https://github.com/LegendRain1130/sleep-alarm-android/releases/tag/v0.1.0
