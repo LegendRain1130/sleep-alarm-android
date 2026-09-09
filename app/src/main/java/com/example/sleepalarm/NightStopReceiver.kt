@@ -6,12 +6,8 @@ import android.content.Intent
 
 class NightStopReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
-        WakeAlarmManager.cancelInternalWake(context)
-
-        context.stopService(Intent(context, SleepMonitorService::class.java))
-        context.stopService(Intent(context, AlarmPlayerService::class.java))
-
-        // 重新安排下一轮夜间计划
-        NightScheduler.scheduleDailyWindow(context)
+        // A delayed stop broadcast may belong to an older window. Reconcile saved settings
+        // and the current time before deciding whether the monitor should actually stop.
+        NightScheduler.rescheduleIfNeeded(context)
     }
 }

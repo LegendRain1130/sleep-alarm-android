@@ -7,6 +7,8 @@ import androidx.core.content.ContextCompat
 
 class AlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
+        if (!WakeAlarmManager.consumeInternalWake(context, intent)) return
+
         DebugNotifier.show(
             context = context,
             title = "SleepAlarm 调试",
@@ -14,7 +16,6 @@ class AlarmReceiver : BroadcastReceiver() {
             id = 9001
         )
 
-        WakeAlarmManager.cancelInternalWake(context)
         context.stopService(Intent(context, SleepMonitorService::class.java))
 
         val alarmIntent = Intent(context, AlarmPlayerService::class.java)

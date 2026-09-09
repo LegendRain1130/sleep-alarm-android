@@ -17,15 +17,18 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import androidx.core.app.NotificationCompat
 import android.app.PendingIntent
-import androidx.core.content.ContextCompat
+import android.util.Log
 class AlarmPlayerService : Service() {
 
     private var mediaPlayer: MediaPlayer? = null
+    private val soundSequence = AlarmSoundSequence<Uri>()
+    private var preparationTimeout: Runnable? = null
     private var vibrator: Vibrator? = null
     private val handler = Handler(Looper.getMainLooper())
 
@@ -120,55 +123,93 @@ class AlarmPlayerService : Service() {
     }
 
     private fun playAlarm() {
+        soundSequence.stop()
         stopMediaPlayerOnly()
+        abandonAudioFocus()
         requestAudioFocus()
 
-        val uri = resolveAlarmUri()
+        val attempt = soundSequence.start(resolveAlarmUris())
+        if (attempt == null) {
+            abandonAudioFocus()
+        } else {
+            playSound(attempt)
+        }
+    }
+
+    private fun playSound(attempt: AlarmSoundSequence.Attempt<Uri>) {
+        if (!soundSequence.isCurrent(attempt)) return
 
         try {
             val player = MediaPlayer()
+            // Own the player before any operation that can fail so it is always released.
+            mediaPlayer = player
             player.setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_ALARM)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                     .build()
             )
-            player.setDataSource(this, uri)
+            player.setWakeMode(this, PowerManager.PARTIAL_WAKE_LOCK)
+            player.setDataSource(this, attempt.source)
             player.isLooping = true
-            player.setOnPreparedListener { it.start() }
+            player.setOnPreparedListener { preparedPlayer ->
+                if (soundSequence.isCurrent(attempt) && mediaPlayer === preparedPlayer) {
+                    clearPreparationTimeout()
+                    try {
+                        preparedPlayer.start()
+                    } catch (e: Exception) {
+                        onSoundFailed(attempt, "Unable to start alarm audio", e)
+                    }
+                }
+            }
             player.setOnErrorListener { _, _, _ ->
-                DebugNotifier.show(
-                    context = this,
-                    title = "SleepAlarm 调试",
-                    text = "MediaPlayer 播放失败",
-                    id = 9003
-                )
+                onSoundFailed(attempt, "Alarm audio playback failed")
                 true
             }
+            preparationTimeout = Runnable {
+                onSoundFailed(attempt, "Alarm audio preparation timed out")
+            }.also { handler.postDelayed(it, PREPARATION_TIMEOUT_MS) }
             player.prepareAsync()
-            mediaPlayer = player
         } catch (e: Exception) {
+            onSoundFailed(attempt, "Unable to prepare alarm audio", e)
+        }
+    }
+
+    private fun onSoundFailed(
+        attempt: AlarmSoundSequence.Attempt<Uri>,
+        message: String,
+        error: Exception? = null
+    ) {
+        // Released players can still have callbacks queued; they must not restart an alarm.
+        if (!soundSequence.isCurrent(attempt)) return
+        Log.w(TAG, message, error)
+        val nextAttempt = soundSequence.nextAfterFailure(attempt)
+        stopMediaPlayerOnly()
+        if (nextAttempt != null) {
+            playSound(nextAttempt)
+        } else {
+            abandonAudioFocus()
             DebugNotifier.show(
                 context = this,
                 title = "SleepAlarm 调试",
-                text = "启动音频失败：${e.javaClass.simpleName}",
+                text = "所有闹铃铃声均播放失败，保留振动提醒",
                 id = 9004
             )
         }
     }
 
-    private fun resolveAlarmUri(): Uri {
+    private fun resolveAlarmUris(): List<Uri> {
         val customUriString = SettingsStore.getRingtoneUriString(this)
-        return try {
+        return buildList {
             if (!customUriString.isNullOrBlank()) {
-                Uri.parse(customUriString)
-            } else {
-                RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-                    ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+                runCatching { Uri.parse(customUriString) }.getOrNull()?.let { add(it) }
             }
-        } catch (_: Exception) {
-            RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            // A valid URI can still refer to a deleted file or a revoked permission.
+            listOf(
+                RingtoneManager.TYPE_ALARM,
+                RingtoneManager.TYPE_NOTIFICATION,
+                RingtoneManager.TYPE_RINGTONE
+            ).forEach { type -> RingtoneManager.getDefaultUri(type)?.let { add(it) } }
         }
     }
 
@@ -236,21 +277,29 @@ class AlarmPlayerService : Service() {
     }
 
     private fun stopMediaPlayerOnly() {
-        try {
-            mediaPlayer?.stop()
-        } catch (_: Exception) {
-        }
-
-        try {
-            mediaPlayer?.release()
-        } catch (_: Exception) {
-        }
-
+        clearPreparationTimeout()
+        val player = mediaPlayer
         mediaPlayer = null
+        try {
+            player?.setOnPreparedListener(null)
+            player?.setOnErrorListener(null)
+        } catch (_: Exception) {
+        }
+        // release() is valid even when setDataSource/prepareAsync failed or is still pending.
+        try {
+            player?.release()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun clearPreparationTimeout() {
+        preparationTimeout?.let { handler.removeCallbacks(it) }
+        preparationTimeout = null
     }
 
     private fun stopAlarm() {
         handler.removeCallbacks(autoStopRunnable)
+        soundSequence.stop()
         stopVibration()
         stopMediaPlayerOnly()
         abandonAudioFocus()
@@ -290,5 +339,7 @@ class AlarmPlayerService : Service() {
 
         private const val CHANNEL_ID = "alarm_sound_channel"
         private const val NOTIFICATION_ID = 2001
+        private const val PREPARATION_TIMEOUT_MS = 10_000L
+        private const val TAG = "AlarmPlayerService"
     }
 }

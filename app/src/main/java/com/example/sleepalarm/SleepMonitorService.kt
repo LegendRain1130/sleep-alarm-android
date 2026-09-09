@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -13,6 +14,8 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import java.util.Calendar
@@ -21,8 +24,6 @@ class SleepMonitorService : Service() {
 
     private var screenReceiver: BroadcastReceiver? = null
     private var currentStatus: String = "夜间监测中：等待熄屏"
-    private var currentWakeAtMillis: Long = 0L
-    private var sleepDurationMinutes: Int = 420
 
     private val handler = Handler(Looper.getMainLooper())
     private var pendingCancelRunnable: Runnable? = null
@@ -34,15 +35,17 @@ class SleepMonitorService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val settings = SettingsStore.load(this)
-        sleepDurationMinutes = settings.sleepDurationMinutes
-
         startAsForeground()
+        if (!canMonitor()) return START_NOT_STICKY
 
-        if (currentWakeAtMillis == 0L) {
-            updateMonitorNotification("夜间监测中：等待熄屏")
+        val powerManager = getSystemService(PowerManager::class.java)
+        val keyguardManager = getSystemService(KeyguardManager::class.java)
+        if (!powerManager.isInteractive) {
+            handleScreenOff()
+        } else if (!keyguardManager.isKeyguardLocked) {
+            handleUserPresent()
         } else {
-            updateMonitorNotification("夜间监测中：已预定 ${formatClock(currentWakeAtMillis)}")
+            handleScreenOn()
         }
 
         return START_STICKY
@@ -78,65 +81,65 @@ class SleepMonitorService : Service() {
     }
 
     private fun handleScreenOff() {
-        val settings = SettingsStore.load(this)
-        sleepDurationMinutes = settings.sleepDurationMinutes
-
-        // 如果刚刚只是短暂亮屏，现在又熄屏了，则保留原闹铃，不重置
-        if (pendingCancelRunnable != null && currentWakeAtMillis != 0L) {
-            cancelPendingCancelRunnable()
-            updateMonitorNotification("短暂亮屏已忽略：保留 ${formatClock(currentWakeAtMillis)} 的闹铃")
-            return
-        }
-
-        val now = System.currentTimeMillis()
-        val wakeAt = now + sleepDurationMinutes * 60 * 1000L
-        currentWakeAtMillis = wakeAt
-
-        WakeAlarmManager.scheduleInternalWake(this, wakeAt)
-        updateMonitorNotification(
-            "已预定本体闹铃：${formatClock(wakeAt)}，亮屏后将等待确认"
+        if (!canMonitor()) return
+        cancelPendingCancelRunnable()
+        val previous = WakeAlarmStateStore.load(this)
+        val next = SleepMonitorPolicy.screenOff(
+            previous, System.currentTimeMillis(), SettingsStore.load(this).sleepDurationMinutes
         )
+        if (previous.wakeAtMillis == 0L) {
+            if (!WakeAlarmManager.scheduleInternalWake(this, next.wakeAtMillis)) {
+                stopSelf()
+                return
+            }
+        } else {
+            WakeAlarmStateStore.save(this, next)
+        }
+        updateMonitorNotification("已预定闹铃：${formatClock(next.wakeAtMillis)}，短暂亮屏不会重置")
     }
 
     private fun handleScreenOn() {
-        if (currentWakeAtMillis == 0L) {
+        if (!canMonitor()) return
+        cancelPendingCancelRunnable()
+        val previous = WakeAlarmStateStore.load(this)
+        val now = SystemClock.elapsedRealtime()
+        val next = SleepMonitorPolicy.screenOn(previous, now)
+        if (next.wakeAtMillis == 0L) {
+            if (previous.wakeAtMillis != 0L) WakeAlarmManager.cancelInternalWake(this)
             updateMonitorNotification("夜间监测中：等待熄屏")
             return
         }
-
-        // 已经有一个“亮屏确认取消”的等待任务，就不要重复添加
-        if (pendingCancelRunnable != null) {
-            return
-        }
-
-        updateMonitorNotification("检测到亮屏：若 $SCREEN_ON_GRACE_SECONDS 秒内未重新熄屏，将取消闹铃")
-
-        val runnable = Runnable {
-            if (currentWakeAtMillis != 0L) {
-                val cancelledAt = currentWakeAtMillis
-                WakeAlarmManager.cancelInternalWake(this)
-                currentWakeAtMillis = 0L
-                updateMonitorNotification("亮屏持续过久：已取消 ${formatClock(cancelledAt)} 的闹铃")
-            }
+        WakeAlarmStateStore.save(this, next)
+        updateMonitorNotification("检测到亮屏：持续 20 秒或解锁将取消闹铃")
+        pendingCancelRunnable = Runnable {
             pendingCancelRunnable = null
-        }
-
-        pendingCancelRunnable = runnable
-        handler.postDelayed(runnable, SCREEN_ON_GRACE_MILLIS)
+            if (canMonitor()) {
+                if (getSystemService(PowerManager::class.java).isInteractive) {
+                    handleScreenOn()
+                } else {
+                    handleScreenOff()
+                }
+            }
+        }.also { handler.postDelayed(it, (next.cancelAtElapsedMillis - now).coerceAtLeast(1L)) }
     }
 
     private fun handleUserPresent() {
-        // 用户已经解锁，视为主动使用手机，立即取消
+        if (!canMonitor()) return
         cancelPendingCancelRunnable()
+        WakeAlarmManager.cancelInternalWake(this)
+        updateMonitorNotification("已解锁：等待下一次熄屏")
+    }
 
-        if (currentWakeAtMillis != 0L) {
-            val cancelledAt = currentWakeAtMillis
-            WakeAlarmManager.cancelInternalWake(this)
-            currentWakeAtMillis = 0L
-            updateMonitorNotification("已解锁：取消 ${formatClock(cancelledAt)} 的闹铃，等待下一次熄屏")
-        } else {
-            updateMonitorNotification("夜间监测中：等待熄屏")
-        }
+    private fun canMonitor(): Boolean {
+        val settings = SettingsStore.load(this)
+        if (settings.planEnabled && settings.sleepDurationMinutes > 0 &&
+            NightScheduler.isNowWithinWindow(settings, System.currentTimeMillis()) &&
+            WakeAlarmManager.canScheduleExactAlarms(this)
+        ) return true
+        cancelPendingCancelRunnable()
+        WakeAlarmManager.cancelInternalWake(this)
+        stopSelf()
+        return false
     }
 
     private fun cancelPendingCancelRunnable() {
@@ -211,7 +214,5 @@ class SleepMonitorService : Service() {
         private const val MONITOR_CHANNEL_ID = "night_monitor_channel"
         private const val MONITOR_NOTIFICATION_ID = 1001
 
-        private const val SCREEN_ON_GRACE_SECONDS = 20
-        private const val SCREEN_ON_GRACE_MILLIS = SCREEN_ON_GRACE_SECONDS * 1000L
     }
 }

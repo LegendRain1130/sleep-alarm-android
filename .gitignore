@@ -16,3 +16,6 @@ app/build
 *.jks
 *.keystore
 keystore.properties
+/.idea/
+/.kotlin/
+/app/release/

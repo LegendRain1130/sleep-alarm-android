@@ -3,11 +3,13 @@ package com.example.sleepalarm
 import android.Manifest
 import android.app.TimePickerDialog
 import android.content.Context
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -20,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -121,6 +124,7 @@ fun AppScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .safeDrawingPadding()
             .verticalScroll(rememberScrollState())
             .imePadding()
             .pointerInput(Unit) {
@@ -239,8 +243,23 @@ fun AppScreen(
                 focusManager.clearFocus()
 
                 val duration = sleepDurationText.toIntOrNull()
-                if (duration == null || duration <= 0) {
-                    status = "输入有误：请检查睡眠时长"
+                if (duration == null || duration !in 1..1440) {
+                    status = "请输入 1–1440 分钟的睡眠时长"
+                    return@Button
+                }
+
+                if (!WakeAlarmManager.canScheduleExactAlarms(context)) {
+                    status = "请允许“闹钟和提醒”权限，返回后再次保存设置"
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        try {
+                            context.startActivity(Intent(
+                                Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                                Uri.parse("package:${context.packageName}")
+                            ))
+                        } catch (_: ActivityNotFoundException) {
+                            status = "请在系统设置中为本应用开启“闹钟和提醒”权限"
+                        }
+                    }
                     return@Button
                 }
 
@@ -257,8 +276,11 @@ fun AppScreen(
                     )
                 )
 
-                NightScheduler.scheduleDailyWindow(context)
-                status = "已保存设置并安排夜间计划"
+                status = if (NightScheduler.scheduleDailyWindow(context)) {
+                    "已保存设置并安排夜间计划"
+                } else {
+                    "未能安排计划，请检查“闹钟和提醒”权限后重新保存"
+                }
             },
             modifier = Modifier.fillMaxWidth()
         ) {
@@ -292,8 +314,8 @@ fun AppScreen(
                     focusManager.clearFocus()
 
                     val duration = sleepDurationText.toIntOrNull()
-                    if (duration == null || duration <= 0) {
-                        status = "输入有误：请检查睡眠时长"
+                    if (duration == null || duration !in 1..1440) {
+                        status = "请输入 1–1440 分钟的睡眠时长"
                         return@Button
                     }
 
@@ -363,7 +385,7 @@ fun AppScreen(
         Spacer(modifier = Modifier.height(8.dp))
 
         Text(
-            text = "提示：夜间开始后会自动进入监测；每次熄屏都会按当前时间与睡眠时长重新预定闹铃，亮屏则取消。",
+            text = "提示：夜间开始后自动监测，已经熄屏也会安排闹铃。短暂亮屏后 20 秒内再次熄屏保留原闹铃；解锁或持续亮屏 20 秒会取消。夜间结束会取消尚未响起的闹铃；开始与结束相同表示全天监测。",
             style = MaterialTheme.typography.bodyMedium
         )
 

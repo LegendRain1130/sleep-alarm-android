@@ -4,39 +4,99 @@ import android.app.AlarmManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 
 object WakeAlarmManager {
 
     private const val REQUEST_CODE_WAKE_ALARM = 1001
     private const val REQUEST_CODE_SHOW_APP = 1002
+    private const val EXTRA_TRIGGER_AT = "com.example.sleepalarm.TRIGGER_AT_MILLIS"
 
-    fun scheduleInternalWake(context: Context, triggerAtMillis: Long) {
-        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+    fun canScheduleExactAlarms(context: Context): Boolean {
+        val manager = context.getSystemService(AlarmManager::class.java)
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.S || manager.canScheduleExactAlarms()
+    }
 
-        val showIntent = Intent(context, MainActivity::class.java)
+    fun scheduleInternalWake(context: Context, triggerAtMillis: Long): Boolean {
+        if (triggerAtMillis <= 0L || !canScheduleExactAlarms(context)) {
+            cancelInternalWake(context)
+            return false
+        }
+
+        val alarmManager = context.getSystemService(AlarmManager::class.java)
         val showPendingIntent = PendingIntent.getActivity(
             context,
             REQUEST_CODE_SHOW_APP,
-            showIntent,
+            Intent(context, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val wakeIntent = Intent(context, AlarmReceiver::class.java)
+            .putExtra(EXTRA_TRIGGER_AT, triggerAtMillis)
+        val wakePendingIntent = PendingIntent.getBroadcast(
+            context,
+            REQUEST_CODE_WAKE_ALARM,
+            wakeIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val alarmClockInfo = AlarmManager.AlarmClockInfo(triggerAtMillis, showPendingIntent)
-        alarmManager.setAlarmClock(alarmClockInfo, wakePendingIntent(context))
+        return try {
+            alarmManager.setAlarmClock(
+                AlarmManager.AlarmClockInfo(triggerAtMillis, showPendingIntent),
+                wakePendingIntent
+            )
+            WakeAlarmStateStore.save(context, WakeAlarmState(wakeAtMillis = triggerAtMillis))
+            true
+        } catch (_: SecurityException) {
+            // Permission can be revoked between checking it and registering the alarm.
+            cancelInternalWake(context)
+            false
+        }
     }
 
     fun cancelInternalWake(context: Context) {
-        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        alarmManager.cancel(wakePendingIntent(context))
-    }
-
-    private fun wakePendingIntent(context: Context): PendingIntent {
-        val intent = Intent(context, AlarmReceiver::class.java)
-        return PendingIntent.getBroadcast(
+        // Clear shared state first so an already queued broadcast cannot start playback.
+        WakeAlarmStateStore.save(context, WakeAlarmState())
+        val pendingIntent = PendingIntent.getBroadcast(
             context,
             REQUEST_CODE_WAKE_ALARM,
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            Intent(context, AlarmReceiver::class.java),
+            PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+        ) ?: return
+        context.getSystemService(AlarmManager::class.java).cancel(pendingIntent)
+        pendingIntent.cancel()
+    }
+
+    fun restoreAfterBoot(context: Context) {
+        val settings = SettingsStore.load(context)
+        val now = System.currentTimeMillis()
+        val restored = SleepMonitorPolicy.afterBoot(
+            WakeAlarmStateStore.load(context),
+            now,
+            settings.planEnabled && NightScheduler.isNowWithinWindow(settings, now)
         )
+        if (restored.wakeAtMillis == 0L) {
+            cancelInternalWake(context)
+        } else {
+            scheduleInternalWake(context, restored.wakeAtMillis)
+        }
+    }
+
+    internal fun consumeInternalWake(context: Context, intent: Intent?): Boolean {
+        val settings = SettingsStore.load(context)
+        if (!settings.planEnabled ||
+            !NightScheduler.isNowWithinWindow(settings, System.currentTimeMillis())
+        ) {
+            cancelInternalWake(context)
+            return false
+        }
+        val triggerAt = intent?.getLongExtra(EXTRA_TRIGGER_AT, 0L) ?: 0L
+        if (!SleepMonitorPolicy.acceptsAlarm(
+                WakeAlarmStateStore.load(context), triggerAt, System.currentTimeMillis()
+            )
+        ) {
+            return false
+        }
+        cancelInternalWake(context)
+        return true
     }
 }
