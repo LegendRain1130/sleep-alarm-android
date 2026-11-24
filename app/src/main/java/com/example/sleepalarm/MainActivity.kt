@@ -1,431 +1,209 @@
 package com.example.sleepalarm
 
 import android.Manifest
+import android.app.NotificationManager
 import android.app.TimePickerDialog
-import android.content.Context
 import android.content.ActivityNotFoundException
 import android.content.Intent
-import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawingPadding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.example.sleepalarm.ui.theme.SleepAlarmTheme
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
-private const val SHOW_DEBUG_TOOLS = false
+internal enum class AlarmPermission { EXACT, NOTIFICATIONS, FULL_SCREEN }
+
+internal data class AlarmAccess(
+    val exact: Boolean = false,
+    val notifications: Boolean = false,
+    val fullScreen: Boolean = false
+)
 
 class MainActivity : ComponentActivity() {
+    private var settings by mutableStateOf(AppSettings())
+    private var ringtoneTitle by mutableStateOf("")
+    private var access by mutableStateOf(AlarmAccess())
+    private var nowMillis by mutableLongStateOf(System.currentTimeMillis())
 
-    private var ringtoneSummary by mutableStateOf("默认系统闹铃")
+    private val notificationRequest =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { refreshAccess() }
 
-    private val requestNotificationPermission =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
-
-    private val ringtonePickerLauncher =
+    private val ringtonePicker =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             if (result.resultCode == RESULT_OK) {
-                val pickedUri = if (Build.VERSION.SDK_INT >= 33) {
-                    result.data?.getParcelableExtra(
-                        RingtoneManager.EXTRA_RINGTONE_PICKED_URI,
-                        Uri::class.java
-                    )
-                } else {
-                    @Suppress("DEPRECATION")
-                    result.data?.getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
-                }
-
-                SettingsStore.saveRingtoneUri(this, pickedUri?.toString())
-                ringtoneSummary = RingtoneHelper.getRingtoneTitle(this, pickedUri?.toString())
+                SettingsStore.saveRingtoneUri(this, RingtoneHelper.pickedUri(result.data)?.toString())
+                refreshSettings()
             }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        ringtoneSummary = RingtoneHelper.getRingtoneTitle(
-            this,
-            SettingsStore.getRingtoneUriString(this)
-        )
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
-
+        refreshSettings()
+        WakeAlarmStateStore.refresh(this)
         setContent {
             SleepAlarmTheme {
-                AppScreen(
-                    ringtoneSummary = ringtoneSummary,
-                    onPickRingtone = {
-                        val existingUriString = SettingsStore.getRingtoneUriString(this)
-                        ringtonePickerLauncher.launch(
-                            RingtoneHelper.buildPickerIntent(existingUriString)
-                        )
-                    }
+                val wakeState by WakeAlarmStateStore.state.collectAsState()
+                val monitoring by SleepMonitorService.monitoring.collectAsState()
+                val ringing by AlarmPlayerService.ringing.collectAsState()
+                AlarmHomeScreen(
+                    settings = settings,
+                    access = access,
+                    ringtoneTitle = ringtoneTitle,
+                    nowMillis = nowMillis,
+                    wakeState = wakeState,
+                    monitoring = monitoring,
+                    ringing = ringing,
+                    onTogglePlan = ::togglePlan,
+                    onEditTime = ::editTime,
+                    onEditDuration = { saveSettings(settings.copy(sleepDurationMinutes = it)) },
+                    onPickRingtone = ::pickRingtone,
+                    onPermission = ::requestAccess,
+                    onResumeMonitoring = { NightScheduler.rescheduleIfNeeded(this) },
+                    onTryRingtone = if (BuildConfig.DEBUG) ::tryRingtone else null,
+                    onStopRinging = { AlarmPlayerService.stop(this, it.id) }
                 )
             }
         }
-    }
-}
-
-@Composable
-fun AppScreen(
-    ringtoneSummary: String,
-    onPickRingtone: () -> Unit
-) {
-    val context = LocalContext.current
-    val focusManager = LocalFocusManager.current
-    val initialSettings = remember { SettingsStore.load(context) }
-
-    var nightStartHour by remember { mutableStateOf(initialSettings.nightStartHour) }
-    var nightStartMinute by remember { mutableStateOf(initialSettings.nightStartMinute) }
-    var nightEndHour by remember { mutableStateOf(initialSettings.nightEndHour) }
-    var nightEndMinute by remember { mutableStateOf(initialSettings.nightEndMinute) }
-    var sleepDurationText by remember {
-        mutableStateOf(initialSettings.sleepDurationMinutes.toString())
-    }
-    var status by remember {
-        mutableStateOf(if (initialSettings.planEnabled) "夜间计划已开启" else "夜间计划未开启")
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .safeDrawingPadding()
-            .verticalScroll(rememberScrollState())
-            .imePadding()
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onTap = { focusManager.clearFocus() }
-                )
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                while (true) {
+                    nowMillis = System.currentTimeMillis()
+                    delay(60_000L - (nowMillis % 60_000L))
+                }
             }
-            .padding(24.dp),
-        verticalArrangement = Arrangement.Top
-    ) {
-        Spacer(modifier = Modifier.height(16.dp))
+        }
+    }
 
-        Text(
-            text = "Sleep Alarm",
-            style = MaterialTheme.typography.headlineMedium
+    override fun onResume() {
+        super.onResume()
+        val hadExactAccess = access.exact
+        refreshAccess()
+        WakeAlarmStateStore.refresh(this)
+        if (settings.planEnabled && hadExactAccess != access.exact) {
+            NightScheduler.rescheduleIfNeeded(this)
+        }
+    }
+
+    private fun refreshSettings() {
+        settings = SettingsStore.load(this)
+        ringtoneTitle = RingtoneHelper.getRingtoneTitle(this, settings.ringtoneUriString)
+    }
+
+    private fun refreshAccess() {
+        val notifications = getSystemService(NotificationManager::class.java)
+        val alarmChannel = notifications.getNotificationChannel(AlarmPlayerService.CHANNEL_ID)
+        access = AlarmAccess(
+            exact = WakeAlarmManager.canScheduleExactAlarms(this),
+            notifications = notifications.areNotificationsEnabled() &&
+                (alarmChannel == null || alarmChannel.importance >= NotificationManager.IMPORTANCE_HIGH),
+            fullScreen = Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE ||
+                notifications.canUseFullScreenIntent()
         )
+    }
 
-        Spacer(modifier = Modifier.height(12.dp))
+    private fun togglePlan(enabled: Boolean) {
+        if (enabled) {
+            saveSettings(settings.copy(planEnabled = true))
+        } else {
+            NightScheduler.cancelDailyWindow(this)
+            settings = SettingsStore.load(this)
+        }
+    }
 
-        Text(
-            text = "夜间睡眠闹铃",
-            style = MaterialTheme.typography.bodyLarge
-        )
+    private fun saveSettings(updated: AppSettings) {
+        SettingsStore.save(this, updated)
+        settings = updated
+        if (updated.planEnabled) NightScheduler.scheduleDailyWindow(this)
+    }
 
-        Spacer(modifier = Modifier.height(16.dp))
+    private fun editTime(start: Boolean) {
+        val hour = if (start) settings.nightStartHour else settings.nightEndHour
+        val minute = if (start) settings.nightStartMinute else settings.nightEndMinute
+        TimePickerDialog(this, { _, selectedHour, selectedMinute ->
+            val updated = if (start) {
+                settings.copy(nightStartHour = selectedHour, nightStartMinute = selectedMinute)
+            } else {
+                settings.copy(nightEndHour = selectedHour, nightEndMinute = selectedMinute)
+            }
+            saveSettings(updated)
+        }, hour, minute, true).show()
+    }
 
-        Button(
-            onClick = {
-                context.stopService(
-                    Intent(context, AlarmPlayerService::class.java).apply {
-                        action = AlarmPlayerService.ACTION_STOP_ALARM
-                    }
-                )
-                status = "已尝试停止响铃"
-            },
-            modifier = Modifier.fillMaxWidth()
+    private fun tryRingtone() {
+        ContextCompat.startForegroundService(this, AlarmPlayerService.previewIntent(this))
+    }
+
+    private fun pickRingtone() {
+        try {
+            ringtonePicker.launch(RingtoneHelper.buildPickerIntent(settings.ringtoneUriString))
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, R.string.ringtone_picker_unavailable, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun requestAccess(permission: AlarmPermission) {
+        val packageUri = Uri.fromParts("package", packageName, null)
+        when (permission) {
+            AlarmPermission.EXACT -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                openSettings(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, packageUri))
+            }
+            AlarmPermission.FULL_SCREEN -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                openSettings(Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, packageUri))
+            }
+            AlarmPermission.NOTIFICATIONS -> requestNotifications()
+        }
+    }
+
+    private fun requestNotifications() {
+        val notifications = getSystemService(NotificationManager::class.java)
+        if (notifications.areNotificationsEnabled() &&
+            notifications.getNotificationChannel(AlarmPlayerService.CHANNEL_ID) != null
         ) {
-            Text("停止当前响铃")
+            openSettings(
+                Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                    .putExtra(Settings.EXTRA_CHANNEL_ID, AlarmPlayerService.CHANNEL_ID)
+            )
+            return
         }
-
-        Spacer(modifier = Modifier.height(20.dp))
-
-        TimeSettingRow(
-            label = "夜间开始时间",
-            timeText = formatHm(nightStartHour, nightStartMinute),
-            onClick = {
-                focusManager.clearFocus()
-                showTimePicker(
-                    context = context,
-                    initialHour = nightStartHour,
-                    initialMinute = nightStartMinute
-                ) { h, m ->
-                    nightStartHour = h
-                    nightStartMinute = m
-                }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val preferences = getPreferences(MODE_PRIVATE)
+            val asked = preferences.getBoolean(KEY_ASKED_NOTIFICATIONS, false)
+            if (!asked || shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)) {
+                preferences.edit().putBoolean(KEY_ASKED_NOTIFICATIONS, true).apply()
+                notificationRequest.launch(Manifest.permission.POST_NOTIFICATIONS)
+                return
             }
-        )
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        TimeSettingRow(
-            label = "夜间结束时间",
-            timeText = formatHm(nightEndHour, nightEndMinute),
-            onClick = {
-                focusManager.clearFocus()
-                showTimePicker(
-                    context = context,
-                    initialHour = nightEndHour,
-                    initialMinute = nightEndMinute
-                ) { h, m ->
-                    nightEndHour = h
-                    nightEndMinute = m
-                }
-            }
-        )
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        OutlinedTextField(
-            value = sleepDurationText,
-            onValueChange = { input ->
-                sleepDurationText = input.filter { it.isDigit() }
-            },
-            label = { Text("睡眠时长（分钟）") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(
-                keyboardType = KeyboardType.Number,
-                imeAction = ImeAction.Done
-            ),
-            keyboardActions = KeyboardActions(
-                onDone = { focusManager.clearFocus() }
-            ),
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        Spacer(modifier = Modifier.height(20.dp))
-
-        Text("本体铃声：$ringtoneSummary")
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Button(
-            onClick = {
-                focusManager.clearFocus()
-                onPickRingtone()
-            },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("选择本体铃声")
         }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        Button(
-            onClick = {
-                focusManager.clearFocus()
-
-                val duration = sleepDurationText.toIntOrNull()
-                if (duration == null || duration !in 1..1440) {
-                    status = "请输入 1–1440 分钟的睡眠时长"
-                    return@Button
-                }
-
-                if (!WakeAlarmManager.canScheduleExactAlarms(context)) {
-                    status = "请允许“闹钟和提醒”权限，返回后再次保存设置"
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        try {
-                            context.startActivity(Intent(
-                                Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
-                                Uri.parse("package:${context.packageName}")
-                            ))
-                        } catch (_: ActivityNotFoundException) {
-                            status = "请在系统设置中为本应用开启“闹钟和提醒”权限"
-                        }
-                    }
-                    return@Button
-                }
-
-                val old = SettingsStore.load(context)
-                SettingsStore.save(
-                    context,
-                    old.copy(
-                        nightStartHour = nightStartHour,
-                        nightStartMinute = nightStartMinute,
-                        nightEndHour = nightEndHour,
-                        nightEndMinute = nightEndMinute,
-                        sleepDurationMinutes = duration,
-                        planEnabled = true
-                    )
-                )
-
-                status = if (NightScheduler.scheduleDailyWindow(context)) {
-                    "已保存设置并安排夜间计划"
-                } else {
-                    "未能安排计划，请检查“闹钟和提醒”权限后重新保存"
-                }
-            },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("保存设置并安排夜间计划")
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        Button(
-            onClick = {
-                focusManager.clearFocus()
-
-                NightScheduler.cancelDailyWindow(context)
-                WakeAlarmManager.cancelInternalWake(context)
-
-                context.stopService(Intent(context, SleepMonitorService::class.java))
-                context.stopService(Intent(context, AlarmPlayerService::class.java))
-
-                status = "已关闭夜间计划并停止当前监测"
-            },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("关闭夜间计划")
-        }
-
-        if (SHOW_DEBUG_TOOLS) {
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Button(
-                onClick = {
-                    focusManager.clearFocus()
-
-                    val duration = sleepDurationText.toIntOrNull()
-                    if (duration == null || duration !in 1..1440) {
-                        status = "请输入 1–1440 分钟的睡眠时长"
-                        return@Button
-                    }
-
-                    val old = SettingsStore.load(context)
-                    SettingsStore.save(
-                        context,
-                        old.copy(
-                            nightStartHour = nightStartHour,
-                            nightStartMinute = nightStartMinute,
-                            nightEndHour = nightEndHour,
-                            nightEndMinute = nightEndMinute,
-                            sleepDurationMinutes = duration
-                        )
-                    )
-
-                    val intent = Intent(context, SleepMonitorService::class.java)
-                    ContextCompat.startForegroundService(context, intent)
-                    status = "已手动启动监测（调试）"
-                },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("手动开始监测（调试）")
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Button(
-                onClick = {
-                    focusManager.clearFocus()
-
-                    WakeAlarmManager.cancelInternalWake(context)
-                    context.stopService(Intent(context, SleepMonitorService::class.java))
-                    status = "已停止当前监测"
-                },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("停止当前监测")
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Button(
-                onClick = {
-                    focusManager.clearFocus()
-
-                    WakeAlarmManager.scheduleInternalWake(
-                        context,
-                        System.currentTimeMillis() + 2 * 60 * 1000L
-                    )
-                    status = "已创建 2 分钟后的本体测试闹铃"
-                },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("测试本体闹铃（2分钟）")
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-        }
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        Text(
-            text = "当前状态：$status",
-            style = MaterialTheme.typography.bodyLarge
+        openSettings(
+            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
         )
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Text(
-            text = "提示：夜间开始后自动监测，已经熄屏也会安排闹铃。短暂亮屏后 20 秒内再次熄屏保留原闹铃；解锁或持续亮屏 20 秒会取消。夜间结束会取消尚未响起的闹铃；开始与结束相同表示全天监测。",
-            style = MaterialTheme.typography.bodyMedium
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
     }
-}
 
-@Composable
-private fun TimeSettingRow(
-    label: String,
-    timeText: String,
-    onClick: () -> Unit
-) {
-    Text(label)
-    Spacer(modifier = Modifier.height(6.dp))
-    Button(
-        onClick = onClick,
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Text(timeText)
+    private fun openSettings(intent: Intent) {
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, R.string.alarm_settings_unavailable, Toast.LENGTH_SHORT).show()
+        }
     }
-}
 
-private fun formatHm(hour: Int, minute: Int): String {
-    return "%02d:%02d".format(hour, minute)
-}
-
-private fun showTimePicker(
-    context: Context,
-    initialHour: Int,
-    initialMinute: Int,
-    onPicked: (Int, Int) -> Unit
-) {
-    TimePickerDialog(
-        context,
-        { _, hourOfDay, minute ->
-            onPicked(hourOfDay, minute)
-        },
-        initialHour,
-        initialMinute,
-        true
-    ).show()
+    private companion object {
+        const val KEY_ASKED_NOTIFICATIONS = "asked_notifications"
+    }
 }

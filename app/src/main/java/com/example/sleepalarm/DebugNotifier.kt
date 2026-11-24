@@ -3,7 +3,6 @@ package com.example.sleepalarm
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
-import android.content.pm.ApplicationInfo
 import android.os.Build
 import androidx.core.app.NotificationCompat
 
@@ -12,7 +11,7 @@ object DebugNotifier {
     private const val CHANNEL_ID = "debug_alarm_channel"
 
     fun show(context: Context, title: String, text: String, id: Int) {
-        if (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
+        if (!BuildConfig.DEBUG) return
         createChannelIfNeeded(context)
 
         val notification = NotificationCompat.Builder(context, CHANNEL_ID)

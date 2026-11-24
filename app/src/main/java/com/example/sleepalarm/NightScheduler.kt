@@ -16,7 +16,7 @@ object NightScheduler {
         val settings = SettingsStore.load(context)
         if (!settings.planEnabled || !WakeAlarmManager.canScheduleExactAlarms(context)) {
             cancelScheduledBoundaries(context)
-            stopCurrentWindow(context)
+            cancelPendingWakeAndStopMonitor(context)
             return false
         }
 
@@ -36,11 +36,12 @@ object NightScheduler {
         } catch (_: SecurityException) {
             // Permission can change between the permission check and either alarm call.
             cancelScheduledBoundaries(context)
-            stopCurrentWindow(context)
+            cancelPendingWakeAndStopMonitor(context)
             return false
         }
 
-        if (window.isWithinWindow) {
+        val wakeState = WakeAlarmStateStore.load(context)
+        if (SleepMonitorPolicy.shouldMonitor(window.isWithinWindow, wakeState)) {
             try {
                 ContextCompat.startForegroundService(
                     context,
@@ -53,8 +54,7 @@ object NightScheduler {
                 return false
             }
         } else {
-            // Saving a different window must also stop a monitor from the previous window.
-            stopCurrentWindow(context)
+            context.stopService(Intent(context, SleepMonitorService::class.java))
         }
         return true
     }
@@ -63,13 +63,11 @@ object NightScheduler {
         val settings = SettingsStore.load(context)
         SettingsStore.save(context, settings.copy(planEnabled = false))
         cancelScheduledBoundaries(context)
-        stopCurrentWindow(context)
+        cancelPendingWakeAndStopMonitor(context)
+        context.stopService(Intent(context, AlarmPlayerService::class.java))
     }
 
     fun rescheduleIfNeeded(context: Context): Boolean = scheduleDailyWindow(context)
-
-    fun isNowWithinWindow(settings: AppSettings, nowMillis: Long): Boolean =
-        NightWindow.calculate(settings, nowMillis).isWithinWindow
 
     private fun cancelScheduledBoundaries(context: Context) {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
@@ -77,10 +75,9 @@ object NightScheduler {
         alarmManager.cancel(stopPendingIntent(context))
     }
 
-    private fun stopCurrentWindow(context: Context) {
+    private fun cancelPendingWakeAndStopMonitor(context: Context) {
         WakeAlarmManager.cancelInternalWake(context)
         context.stopService(Intent(context, SleepMonitorService::class.java))
-        context.stopService(Intent(context, AlarmPlayerService::class.java))
     }
 
     private fun startPendingIntent(context: Context): PendingIntent {

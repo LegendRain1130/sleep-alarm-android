@@ -53,9 +53,9 @@ object WakeAlarmManager {
         }
     }
 
-    fun cancelInternalWake(context: Context) {
+    internal fun cancelInternalWake(context: Context, nextState: WakeAlarmState = WakeAlarmState()) {
         // Clear shared state first so an already queued broadcast cannot start playback.
-        WakeAlarmStateStore.save(context, WakeAlarmState())
+        WakeAlarmStateStore.save(context, nextState)
         val pendingIntent = PendingIntent.getBroadcast(
             context,
             REQUEST_CODE_WAKE_ALARM,
@@ -72,7 +72,7 @@ object WakeAlarmManager {
         val restored = SleepMonitorPolicy.afterBoot(
             WakeAlarmStateStore.load(context),
             now,
-            settings.planEnabled && NightScheduler.isNowWithinWindow(settings, now)
+            settings.planEnabled
         )
         if (restored.wakeAtMillis == 0L) {
             cancelInternalWake(context)
@@ -81,22 +81,19 @@ object WakeAlarmManager {
         }
     }
 
-    internal fun consumeInternalWake(context: Context, intent: Intent?): Boolean {
-        val settings = SettingsStore.load(context)
-        if (!settings.planEnabled ||
-            !NightScheduler.isNowWithinWindow(settings, System.currentTimeMillis())
-        ) {
+    internal fun consumeInternalWake(context: Context, intent: Intent?): Long? {
+        if (!SettingsStore.load(context).planEnabled) {
             cancelInternalWake(context)
-            return false
+            return null
         }
         val triggerAt = intent?.getLongExtra(EXTRA_TRIGGER_AT, 0L) ?: 0L
         if (!SleepMonitorPolicy.acceptsAlarm(
                 WakeAlarmStateStore.load(context), triggerAt, System.currentTimeMillis()
             )
         ) {
-            return false
+            return null
         }
         cancelInternalWake(context)
-        return true
+        return triggerAt
     }
 }
